@@ -15,6 +15,7 @@
 - **Live watch** — resources appear and update in real time as the cluster changes; deleted resources show `[DELETED]`
 - **Unhealthy-first ordering** — `CrashLoopBackOff`, `Error`, `ImagePullBackOff` pods surface to the top automatically
 - **Color-coded status** — red for critical, yellow for warning, green for healthy, dimmed for deleted
+- **Optional OpenCost column** — show per-pod / per-controller cost inline, with namespace or cluster aggregate in the header
 - **Multi-select bulk actions** — `tab` to select multiple resources, then describe/delete/restart them all at once
 - **Multi-cluster support** — watch all kubeconfig contexts simultaneously with `--all-contexts`, or switch contexts interactively with `ctrl-x`
 - **Context persistence** — last-used context is remembered across sessions
@@ -202,10 +203,34 @@ kf --kubeconfig ~/alt.yaml --context staging  # use an alternate kubeconfig
 
 ---
 
+## Optional Cost Awareness
+
+Create `~/.config/kuberift/config.toml`:
+
+```toml
+[cost]
+enabled = true
+opencost_endpoint = ""      # optional manual override; empty = auto-discover in cluster
+display_period = "daily"    # hourly | daily | monthly
+highlight_threshold = 10.0  # highlight resources above $/day
+```
+
+When cost mode is enabled, `kf` will:
+
+- detect `opencost` / `kubecost` services and query `allocation/compute`
+- map pod allocations onto pods and controller-backed resources
+- render a cost column without changing existing actions or output format
+- disable cost for the current session if the endpoint is missing, slow, or unreachable
+
+The namespace filter (`-n production`) also shows the namespace aggregate in the header.
+
+---
+
 ## Config & State
 
 | File | Purpose |
 |------|---------|
+| `~/.config/kuberift/config.toml` | Optional settings (`[cost]`) for OpenCost integration |
 | `~/.config/kuberift/last_context` | Last-used context, restored on next launch |
 | `$XDG_RUNTIME_DIR/<pid>/preview-mode` | Preview mode state (0=describe, 1=yaml, 2=logs) |
 | `$XDG_RUNTIME_DIR/<pid>/preview-toggle` | Shell script installed at startup for ctrl-p |

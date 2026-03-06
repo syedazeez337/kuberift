@@ -13,5 +13,7 @@
 
 pub mod actions;
 pub mod cli;
+pub mod config;
+pub mod cost;
 pub mod items;
 pub mod k8s;

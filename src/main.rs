@@ -15,6 +15,8 @@ use kuberift::actions::{
     action_rollout_restart, action_yaml, install_preview_toggle, preview_toggle_path, runtime_dir,
 };
 use kuberift::cli::Args;
+use kuberift::config::{load_config, AppConfig};
+use kuberift::cost::prefetch_cost_snapshot;
 use kuberift::items::{K8sItem, ResourceKind};
 #[allow(unused_imports)]
 use kuberift::k8s::{
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
     install_preview_toggle();
 
     let kinds: Vec<ResourceKind> = args.resource_filter().unwrap_or_else(|| ALL_KINDS.to_vec());
+    let config = load_config();
 
     let kind_label = if kinds.len() == 1 {
         kinds[0].as_str().to_string()
@@ -73,19 +76,20 @@ async fn main() -> Result<()> {
     };
 
     if args.all_contexts {
-        run_all_contexts(&args, &kinds, &kind_label)
+        run_all_contexts(&args, &kinds, &kind_label, &config).await
     } else {
-        run_single_context(&args, &kinds, &kind_label, args.read_only)
+        run_single_context(&args, &kinds, &kind_label, args.read_only, &config).await
     }
 }
 
 // ─── Single-cluster mode (with ctrl-x context switching) ─────────────────────
 
-fn run_single_context(
+async fn run_single_context(
     args: &Args,
     kinds: &[ResourceKind],
     kind_label: &str,
     read_only: bool,
+    config: &AppConfig,
 ) -> Result<()> {
     let mut active_ctx = args
         .context
@@ -97,6 +101,7 @@ fn run_single_context(
     let label_selector = args.label.as_deref();
 
     loop {
+        let cost_snapshot = prefetch_cost_snapshot(&active_ctx, kubeconfig, &config.cost).await;
         let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
 
         let ctx_for_watcher = active_ctx.clone();
@@ -105,6 +110,7 @@ fn run_single_context(
         let kubeconfig_owned = kubeconfig.map(str::to_string);
         let namespace_owned = namespace.map(str::to_string);
         let label_owned = label_selector.map(str::to_string);
+        let cost_snapshot_owned = cost_snapshot.clone();
         tokio::spawn(async move {
             match build_client_for_context(&ctx_for_watcher, kubeconfig_owned.as_deref()).await {
                 Ok(client) => {
@@ -115,6 +121,7 @@ fn run_single_context(
                         "",
                         namespace_owned.as_deref(),
                         label_owned.as_deref(),
+                        cost_snapshot_owned,
                     )
                     .await
                     {
@@ -132,7 +139,17 @@ fn run_single_context(
 
         drop(tx);
 
-        let options = build_skim_options(&active_ctx, kind_label, true, read_only, namespace)?;
+        let cost_header = cost_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.header_label(namespace));
+        let options = build_skim_options(
+            &active_ctx,
+            kind_label,
+            true,
+            read_only,
+            namespace,
+            cost_header.as_deref(),
+        )?;
         let output = Skim::run_with(options, Some(rx)).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         if output.is_abort {
@@ -159,7 +176,12 @@ fn run_single_context(
 
 // ─── Multi-cluster mode (--all-contexts) ─────────────────────────────────────
 
-fn run_all_contexts(args: &Args, kinds: &[ResourceKind], kind_label: &str) -> Result<()> {
+async fn run_all_contexts(
+    args: &Args,
+    kinds: &[ResourceKind],
+    kind_label: &str,
+    config: &AppConfig,
+) -> Result<()> {
     let contexts = list_contexts();
     if contexts.is_empty() {
         eprintln!("[kuberift] No contexts found in kubeconfig.");
@@ -178,10 +200,17 @@ fn run_all_contexts(args: &Args, kinds: &[ResourceKind], kind_label: &str) -> Re
         let kubeconfig_owned = kubeconfig.map(str::to_string);
         let namespace_owned = namespace.map(str::to_string);
         let label_owned = label_selector.map(str::to_string);
+        let cost_config = config.cost.clone();
 
         tokio::spawn(async move {
             match build_client_for_context(&ctx_clone, kubeconfig_owned.as_deref()).await {
                 Ok(client) => {
+                    let cost_snapshot = prefetch_cost_snapshot(
+                        &ctx_clone,
+                        kubeconfig_owned.as_deref(),
+                        &cost_config,
+                    )
+                    .await;
                     if let Err(e) = watch_resources(
                         client,
                         tx_clone,
@@ -189,6 +218,7 @@ fn run_all_contexts(args: &Args, kinds: &[ResourceKind], kind_label: &str) -> Re
                         &ctx_clone,
                         namespace_owned.as_deref(),
                         label_owned.as_deref(),
+                        cost_snapshot,
                     )
                     .await
                     {
@@ -205,7 +235,14 @@ fn run_all_contexts(args: &Args, kinds: &[ResourceKind], kind_label: &str) -> Re
     drop(tx);
 
     let ctx_label = "all-contexts";
-    let options = build_skim_options(ctx_label, kind_label, false, args.read_only, namespace)?;
+    let options = build_skim_options(
+        ctx_label,
+        kind_label,
+        false,
+        args.read_only,
+        namespace,
+        None,
+    )?;
     let output = Skim::run_with(options, Some(rx)).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if output.is_abort {
@@ -272,6 +309,7 @@ fn build_skim_options(
     show_ctx_switch: bool,
     read_only: bool,
     namespace: Option<&str>,
+    cost_header: Option<&str>,
 ) -> Result<SkimOptions> {
     let ctx_hint = if show_ctx_switch {
         "  ctrl-x switch-ctx"
@@ -280,6 +318,9 @@ fn build_skim_options(
     };
     let ro_hint = if read_only { "  [READ-ONLY]" } else { "" };
     let ns_hint = namespace.map(|n| format!("  ns:{n}")).unwrap_or_default();
+    let cost_hint = cost_header
+        .map(|cost| format!("  {cost}"))
+        .unwrap_or_default();
 
     Ok(SkimOptionsBuilder::default()
         .multi(true)
@@ -287,7 +328,7 @@ fn build_skim_options(
         .preview_window("right:50%")
         .height("60%")
         .header(format!(
-            "KubeRift  ctx:{ctx_label}{ns_hint}  res:{kind_label}{ro_hint}\n\
+            "KubeRift  ctx:{ctx_label}{ns_hint}{cost_hint}  res:{kind_label}{ro_hint}\n\
              <tab> select  <enter> describe  ctrl-l logs  ctrl-e exec  \
              ctrl-d delete  ctrl-f forward  ctrl-r restart  ctrl-y yaml  \
              ctrl-p cycle-preview{ctx_hint}",

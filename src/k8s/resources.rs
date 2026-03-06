@@ -31,6 +31,7 @@ use std::{
 };
 use tokio::sync::Notify;
 
+use crate::cost::CostSnapshot;
 use crate::items::{K8sItem, ResourceKind};
 
 /// All resource kinds to watch when no filter is given.
@@ -65,6 +66,7 @@ pub async fn watch_resources(
     context: &str,
     namespace: Option<&str>,
     label_selector: Option<&str>,
+    cost_snapshot: Option<Arc<CostSnapshot>>,
 ) -> Result<()> {
     let total_watchers = kinds.len();
     let global_init: Arc<Mutex<Vec<K8sItem>>> = Arc::new(Mutex::new(Vec::new()));
@@ -77,12 +79,18 @@ pub async fn watch_resources(
         let global_init = global_init.clone();
         let tx_coord = tx.clone();
         let all_init_done = all_init_done.clone();
+        let cost_snapshot = cost_snapshot.clone();
         tokio::spawn(async move {
             tokio::select! {
                 () = all_init_done.notified() => {}
                 () = tokio::time::sleep(Duration::from_secs(8)) => {}
             }
             let mut buf = global_init.lock().unwrap();
+            if let Some(snapshot) = cost_snapshot.as_deref() {
+                for item in buf.iter_mut() {
+                    snapshot.apply(item);
+                }
+            }
             buf.sort_by_key(|item| std::cmp::Reverse(status_priority(item.status())));
             let sorted: Vec<Arc<dyn skim::SkimItem>> = buf
                 .drain(..)
@@ -106,6 +114,7 @@ pub async fn watch_resources(
         let gi = global_init.clone();
         let dc = done_count.clone();
         let aid = all_init_done.clone();
+        let cost_state = cost_snapshot.clone();
 
         tasks.push(tokio::spawn(async move {
             let result = match k {
@@ -122,6 +131,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -138,6 +148,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -154,6 +165,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -170,6 +182,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -186,6 +199,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -202,6 +216,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -218,6 +233,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -234,6 +250,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -251,6 +268,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -267,6 +285,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -284,6 +303,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -300,6 +320,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -316,6 +337,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -332,6 +354,7 @@ pub async fn watch_resources(
                         dc,
                         total_watchers,
                         aid,
+                        cost_state,
                     )
                     .await
                 }
@@ -379,6 +402,7 @@ async fn watch_typed<T, F>(
     done_count: Arc<AtomicUsize>,
     total_watchers: usize,
     all_init_done: Arc<Notify>,
+    cost_snapshot: Option<Arc<CostSnapshot>>,
 ) -> Result<()>
 where
     T: Resource<DynamicType = ()> + DeserializeOwned + Clone + Send + Sync + Debug + 'static,
@@ -412,7 +436,14 @@ where
 
             // ── Existing object during initial list ───────────────────────────
             Ok(watcher::Event::InitApply(r)) => {
-                let item = make_item(&r, kind, &status_fn, false, &context);
+                let item = make_item(
+                    &r,
+                    kind,
+                    &status_fn,
+                    false,
+                    &context,
+                    cost_snapshot.as_deref(),
+                );
                 if in_init {
                     init_batch.push(item);
                 } else {
@@ -461,7 +492,14 @@ where
 
             // ── Live add / update ─────────────────────────────────────────────
             Ok(watcher::Event::Apply(r)) => {
-                let item = make_item(&r, kind, &status_fn, false, &context);
+                let item = make_item(
+                    &r,
+                    kind,
+                    &status_fn,
+                    false,
+                    &context,
+                    cost_snapshot.as_deref(),
+                );
                 if tx
                     .send(vec![Arc::new(item) as Arc<dyn skim::SkimItem>])
                     .is_err()
@@ -472,7 +510,14 @@ where
 
             // ── Live deletion ─────────────────────────────────────────────────
             Ok(watcher::Event::Delete(r)) => {
-                let item = make_item(&r, kind, &status_fn, true, &context);
+                let item = make_item(
+                    &r,
+                    kind,
+                    &status_fn,
+                    true,
+                    &context,
+                    cost_snapshot.as_deref(),
+                );
                 if tx
                     .send(vec![Arc::new(item) as Arc<dyn skim::SkimItem>])
                     .is_err()
@@ -499,6 +544,7 @@ fn make_item<T>(
     status_fn: &impl Fn(&T) -> String,
     deleted: bool,
     context: &str,
+    cost_snapshot: Option<&CostSnapshot>,
 ) -> K8sItem
 where
     T: Resource<DynamicType = ()>,
@@ -511,7 +557,11 @@ where
         status_fn(r)
     };
     let age = resource_age(r.meta());
-    K8sItem::new(kind, ns, name, status, age, context)
+    let mut item = K8sItem::new(kind, ns, name, status, age, context);
+    if let Some(snapshot) = cost_snapshot {
+        snapshot.apply(&mut item);
+    }
+    item
 }
 
 // ─── Status priority (lower = shown first) ───────────────────────────────────

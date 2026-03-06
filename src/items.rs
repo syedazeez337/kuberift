@@ -172,6 +172,8 @@ pub struct K8sItem {
     age: String,
     /// The cluster context this resource belongs to (empty in single-cluster mode).
     context: String,
+    cost_label: String,
+    cost_highlighted: bool,
 }
 
 impl K8sItem {
@@ -190,6 +192,8 @@ impl K8sItem {
             status: status.into(),
             age: age.into(),
             context: context.into(),
+            cost_label: String::new(),
+            cost_highlighted: false,
         }
     }
 
@@ -207,6 +211,20 @@ impl K8sItem {
     }
     pub fn context(&self) -> &str {
         &self.context
+    }
+
+    pub fn set_cost(&mut self, label: impl Into<String>, highlighted: bool) {
+        self.cost_label = label.into();
+        self.cost_highlighted = highlighted;
+    }
+
+    pub fn clear_cost(&mut self) {
+        self.cost_label.clear();
+        self.cost_highlighted = false;
+    }
+
+    pub fn cost_label(&self) -> Option<&str> {
+        (!self.cost_label.is_empty()).then_some(self.cost_label.as_str())
     }
 
     /// Color the status string based on health — delegates to `StatusHealth`.
@@ -265,13 +283,14 @@ impl SkimItem for K8sItem {
         };
         let name_truncated = truncate_name(&self.name, 31);
         Cow::Owned(format!(
-            "{:<8} {}{}{} {} {}",
+            "{:<8} {}{}{} {} {} {}",
             self.kind.as_str(),
             ctx_prefix,
             ns_prefix,
             name_truncated,
             self.status,
             self.age,
+            self.cost_label,
         ))
     }
 
@@ -316,6 +335,16 @@ impl SkimItem for K8sItem {
             self.age.clone(),
             Style::default().fg(Color::DarkGray),
         ));
+        let cost_col = self.cost_label().map_or_else(
+            || "          ".to_string(),
+            |label| format!(" {:>10}", label),
+        );
+        let cost_color = if self.cost_highlighted {
+            Color::LightRed
+        } else {
+            Color::LightGreen
+        };
+        spans.push(Span::styled(cost_col, Style::default().fg(cost_color)));
 
         Line::from(spans)
     }

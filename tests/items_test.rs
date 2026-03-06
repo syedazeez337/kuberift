@@ -269,6 +269,16 @@ fn k8s_item_empty_namespace_and_context() {
     assert_eq!(item.context(), "");
 }
 
+#[test]
+fn k8s_item_cost_round_trip() {
+    let mut item = K8sItem::new(ResourceKind::Deployment, "default", "api", "2/2", "1d", "");
+    assert_eq!(item.cost_label(), None);
+    item.set_cost("$12.00/d", true);
+    assert_eq!(item.cost_label(), Some("$12.00/d"));
+    item.clear_cost();
+    assert_eq!(item.cost_label(), None);
+}
+
 // ── K8sItem::status_color ─────────────────────────────────────────────────────
 
 #[test]
