@@ -369,8 +369,19 @@ pub async fn watch_resources(
 
         tasks.push(tokio::spawn(async move {
             if let Err(e) = watch_dynamic(
-                c, t, kind, ar, namespaced, dynamic_status, ctx, ns, ls, gi, dc,
-                total_watchers, aid,
+                c,
+                t,
+                kind,
+                ar,
+                namespaced,
+                dynamic_status,
+                ctx,
+                ns,
+                ls,
+                gi,
+                dc,
+                total_watchers,
+                aid,
             )
             .await
             {
@@ -422,8 +433,17 @@ where
 {
     let api: Api<T> = Api::all(client);
     watch_stream(
-        api, tx, kind, status_fn, context, namespace, label_selector, global_init, done_count,
-        total_watchers, all_init_done,
+        api,
+        tx,
+        kind,
+        status_fn,
+        context,
+        namespace,
+        label_selector,
+        global_init,
+        done_count,
+        total_watchers,
+        all_init_done,
     )
     .await
 }
@@ -449,8 +469,17 @@ pub async fn watch_dynamic(
     // For cluster-scoped CRDs, ignore the namespace filter.
     let ns = if namespaced { namespace } else { None };
     watch_stream(
-        api, tx, kind, status_fn, context, ns, label_selector, global_init, done_count,
-        total_watchers, all_init_done,
+        api,
+        tx,
+        kind,
+        status_fn,
+        context,
+        ns,
+        label_selector,
+        global_init,
+        done_count,
+        total_watchers,
+        all_init_done,
     )
     .await
 }

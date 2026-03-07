@@ -78,7 +78,10 @@ pub fn dynamic_status(obj: &DynamicObject) -> String {
         for cond in conditions {
             let cond_type = cond.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if cond_type == "Ready" || cond_type == "Available" {
-                let cond_status = cond.get("status").and_then(|s| s.as_str()).unwrap_or("Unknown");
+                let cond_status = cond
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("Unknown");
                 let reason = cond.get("reason").and_then(|r| r.as_str());
                 return match cond_status {
                     "True" => "Ready".to_string(),
