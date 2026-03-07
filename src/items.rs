@@ -4,6 +4,7 @@ use ratatui::{
 };
 use skim::{DisplayContext, ItemPreview, PreviewContext, SkimItem};
 use std::borrow::Cow;
+use std::sync::{Arc, RwLock};
 
 // ─── Name truncation helper ───────────────────────────────────────────────────
 
@@ -162,16 +163,27 @@ impl std::fmt::Display for ResourceKind {
     }
 }
 
+/// Live-updated mutable state shared between a [`K8sItem`] in skim's list
+/// and the watcher that streams updates from the Kubernetes API.
+#[derive(Debug, Clone)]
+pub struct ItemState {
+    pub status: String,
+    pub age: String,
+}
+
 /// A Kubernetes resource item displayed in the skim TUI.
+///
+/// Mutable display state (status, age) lives behind an [`Arc<RwLock<ItemState>>`]
+/// so the watcher can update a resource in-place without sending a duplicate
+/// entry to skim.
 #[derive(Debug, Clone)]
 pub struct K8sItem {
     kind: ResourceKind,
     namespace: String,
     name: String,
-    status: String,
-    age: String,
     /// The cluster context this resource belongs to (empty in single-cluster mode).
     context: String,
+    state: Arc<RwLock<ItemState>>,
 }
 
 impl K8sItem {
@@ -187,9 +199,30 @@ impl K8sItem {
             kind,
             namespace: namespace.into(),
             name: name.into(),
-            status: status.into(),
-            age: age.into(),
             context: context.into(),
+            state: Arc::new(RwLock::new(ItemState {
+                status: status.into(),
+                age: age.into(),
+            })),
+        }
+    }
+
+    /// Create an item backed by externally-managed live state.
+    /// The watcher holds a clone of `state` and can update it in-place;
+    /// skim reads the current values on every `display()` call.
+    pub fn new_live(
+        kind: ResourceKind,
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        context: impl Into<String>,
+        state: Arc<RwLock<ItemState>>,
+    ) -> Self {
+        Self {
+            kind,
+            namespace: namespace.into(),
+            name: name.into(),
+            context: context.into(),
+            state,
         }
     }
 
@@ -202,16 +235,22 @@ impl K8sItem {
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn status(&self) -> &str {
-        &self.status
+    pub fn status(&self) -> String {
+        self.state.read().unwrap().status.clone()
     }
     pub fn context(&self) -> &str {
         &self.context
     }
 
+    /// The shared live state handle — used by watchers to update this item.
+    pub fn state(&self) -> &Arc<RwLock<ItemState>> {
+        &self.state
+    }
+
     /// Color the status string based on health — delegates to `StatusHealth`.
     pub fn status_color(&self) -> Color {
-        StatusHealth::classify(&self.status).color()
+        let status = self.status();
+        StatusHealth::classify(&status).color()
     }
 
     /// Machine-parseable output string for piping.
@@ -253,6 +292,7 @@ impl SkimItem for K8sItem {
     /// The text skim fuzzy-matches against — plain, no color.
     /// In multi-cluster mode the context name is included so users can search by cluster.
     fn text(&self) -> Cow<'_, str> {
+        let state = self.state.read().unwrap();
         let ctx_prefix = if self.context.is_empty() {
             String::new()
         } else {
@@ -270,8 +310,8 @@ impl SkimItem for K8sItem {
             ctx_prefix,
             ns_prefix,
             name_truncated,
-            self.status,
-            self.age,
+            state.status,
+            state.age,
         ))
     }
 
@@ -279,6 +319,9 @@ impl SkimItem for K8sItem {
     /// In multi-cluster mode a context prefix is shown before the namespace/name,
     /// colored distinctly per cluster.
     fn display(&self, _context: DisplayContext) -> Line<'_> {
+        let state = self.state.read().unwrap();
+        let status_color = StatusHealth::classify(&state.status).color();
+
         let ns_prefix = if self.namespace.is_empty() {
             String::new()
         } else {
@@ -309,11 +352,11 @@ impl SkimItem for K8sItem {
         };
         spans.push(Span::styled(name_col, Style::default().fg(Color::White)));
         spans.push(Span::styled(
-            format!("{:<17} ", self.status),
-            Style::default().fg(self.status_color()),
+            format!("{:<17} ", state.status),
+            Style::default().fg(status_color),
         ));
         spans.push(Span::styled(
-            self.age.clone(),
+            state.age.clone(),
             Style::default().fg(Color::DarkGray),
         ));
 

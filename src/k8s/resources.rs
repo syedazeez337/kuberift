@@ -21,17 +21,18 @@ use kube::{
 use serde::de::DeserializeOwned;
 use skim::SkimItemSender;
 use std::{
+    collections::{HashMap, HashSet},
     fmt::Debug,
     pin::pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::Duration,
 };
 use tokio::sync::Notify;
 
-use crate::items::{K8sItem, ResourceKind};
+use crate::items::{ItemState, K8sItem, ResourceKind};
 
 /// All resource kinds to watch when no filter is given.
 pub const ALL_KINDS: &[ResourceKind] = &[
@@ -83,7 +84,10 @@ pub async fn watch_resources(
                 () = tokio::time::sleep(Duration::from_secs(8)) => {}
             }
             let mut buf = global_init.lock().unwrap();
-            buf.sort_by_key(|item| std::cmp::Reverse(status_priority(item.status())));
+            buf.sort_by_key(|item| {
+                let status = item.status();
+                std::cmp::Reverse(status_priority(&status))
+            });
             let sorted: Vec<Arc<dyn skim::SkimItem>> = buf
                 .drain(..)
                 .map(|item| Arc::new(item) as Arc<dyn skim::SkimItem>)
@@ -395,29 +399,50 @@ where
     let mut stream = pin!(watcher(api, watcher_config).default_backoff());
 
     // Buffer for initial items so we can sort before the first render.
-    // Stored as K8sItem (concrete type) so we can sort without downcast.
     let mut init_batch: Vec<K8sItem> = Vec::new();
     let mut in_init = true;
-    // Track whether this watcher has already contributed to the global init batch.
-    // On reconnects we sort locally and send directly rather than touching global state.
     let mut first_init_done = false;
+
+    // Track live resources: (namespace, name) → shared state handle.
+    // Updates to existing resources mutate state in-place; skim items
+    // read from the same Arc on every display() call.
+    let mut seen: HashMap<(String, String), Arc<RwLock<ItemState>>> = HashMap::new();
+    // Keys observed during the current Init cycle, used to detect
+    // resources deleted while disconnected during a reconnect.
+    let mut init_keys: HashSet<(String, String)> = HashSet::new();
 
     while let Some(event) = stream.next().await {
         match event {
             // ── Init cycle start ──────────────────────────────────────────────
             Ok(watcher::Event::Init) => {
                 init_batch.clear();
+                init_keys.clear();
                 in_init = true;
             }
 
             // ── Existing object during initial list ───────────────────────────
             Ok(watcher::Event::InitApply(r)) => {
-                let item = make_item(&r, kind, &status_fn, false, &context);
-                if in_init {
-                    init_batch.push(item);
+                let ns = r.meta().namespace.clone().unwrap_or_default();
+                let name = r.name_any();
+                let status = status_fn(&r);
+                let age = resource_age(r.meta());
+                let key = (ns.clone(), name.clone());
+
+                init_keys.insert(key.clone());
+
+                if let Some(existing) = seen.get(&key) {
+                    // Resource already tracked from a previous watch cycle —
+                    // update its state in-place so the existing skim entry refreshes.
+                    let mut state = existing.write().unwrap();
+                    state.status = status;
+                    state.age = age;
                 } else {
-                    // Shouldn't occur, but handle gracefully.
-                    if tx
+                    let item_state = Arc::new(RwLock::new(ItemState { status, age }));
+                    seen.insert(key, item_state.clone());
+                    let item = K8sItem::new_live(kind, ns, name, &context, item_state);
+                    if in_init {
+                        init_batch.push(item);
+                    } else if tx
                         .send(vec![Arc::new(item) as Arc<dyn skim::SkimItem>])
                         .is_err()
                     {
@@ -428,13 +453,20 @@ where
 
             // ── Initial list complete ─────────────────────────────────────────
             Ok(watcher::Event::InitDone) => {
+                // Mark resources not seen in this init cycle as deleted
+                // (handles resources removed while disconnected).
+                for (key, state) in &seen {
+                    if !init_keys.contains(key) {
+                        state.write().unwrap().status = "[DELETED]".to_string();
+                    }
+                }
+
                 if first_init_done {
-                    // Reconnect after a watch error: sort this watcher's batch locally
-                    // and send directly — global coordination already happened.
-                    // Skim renders higher-indexed items at the TOP of the list.
-                    // Sending unhealthy items LAST gives them the highest indices.
-                    init_batch
-                        .sort_by_key(|item| std::cmp::Reverse(status_priority(item.status())));
+                    // Reconnect: sort and send only NEW items directly.
+                    init_batch.sort_by_key(|item| {
+                        let status = item.status();
+                        std::cmp::Reverse(status_priority(&status))
+                    });
                     let sorted: Vec<Arc<dyn skim::SkimItem>> = init_batch
                         .drain(..)
                         .map(|item| Arc::new(item) as Arc<dyn skim::SkimItem>)
@@ -461,24 +493,41 @@ where
 
             // ── Live add / update ─────────────────────────────────────────────
             Ok(watcher::Event::Apply(r)) => {
-                let item = make_item(&r, kind, &status_fn, false, &context);
-                if tx
-                    .send(vec![Arc::new(item) as Arc<dyn skim::SkimItem>])
-                    .is_err()
-                {
-                    break;
+                let ns = r.meta().namespace.clone().unwrap_or_default();
+                let name = r.name_any();
+                let status = status_fn(&r);
+                let age = resource_age(r.meta());
+                let key = (ns.clone(), name.clone());
+
+                if let Some(existing) = seen.get(&key) {
+                    // Existing resource — update state in-place.
+                    let mut state = existing.write().unwrap();
+                    state.status = status;
+                    state.age = age;
+                } else {
+                    // New resource appeared after init — send to skim.
+                    let item_state = Arc::new(RwLock::new(ItemState { status, age }));
+                    seen.insert(key, item_state.clone());
+                    let item = K8sItem::new_live(kind, ns, name, &context, item_state);
+                    if tx
+                        .send(vec![Arc::new(item) as Arc<dyn skim::SkimItem>])
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
             }
 
             // ── Live deletion ─────────────────────────────────────────────────
             Ok(watcher::Event::Delete(r)) => {
-                let item = make_item(&r, kind, &status_fn, true, &context);
-                if tx
-                    .send(vec![Arc::new(item) as Arc<dyn skim::SkimItem>])
-                    .is_err()
-                {
-                    break;
+                let ns = r.meta().namespace.clone().unwrap_or_default();
+                let name = r.name_any();
+                let key = (ns, name);
+
+                if let Some(existing) = seen.get(&key) {
+                    existing.write().unwrap().status = "[DELETED]".to_string();
                 }
+                // No new item sent — existing skim item updates via shared state.
             }
 
             // ── Watch error — default_backoff handles retry ───────────────────
@@ -489,29 +538,6 @@ where
     }
 
     Ok(())
-}
-
-// ─── Item constructor helper ─────────────────────────────────────────────────
-
-fn make_item<T>(
-    r: &T,
-    kind: ResourceKind,
-    status_fn: &impl Fn(&T) -> String,
-    deleted: bool,
-    context: &str,
-) -> K8sItem
-where
-    T: Resource<DynamicType = ()>,
-{
-    let ns = r.meta().namespace.clone().unwrap_or_default();
-    let name = r.name_any();
-    let status = if deleted {
-        "[DELETED]".to_string()
-    } else {
-        status_fn(r)
-    };
-    let age = resource_age(r.meta());
-    K8sItem::new(kind, ns, name, status, age, context)
 }
 
 // ─── Status priority (lower = shown first) ───────────────────────────────────
